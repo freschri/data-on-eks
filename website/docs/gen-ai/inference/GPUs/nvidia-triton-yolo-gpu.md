@@ -119,11 +119,13 @@ cd data-on-eks/gen-ai/inference/nvidia-triton-server-gpu/yolo/triton-client
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
-python3 triton-client.py <<YOUR DOWNLOADED IMAGES FOLDER>>
+python3 triton_client.py <<YOUR DOWNLOADED IMAGES FOLDER>>
 ```
 
 From the log, you will be able to see a series of statistics, similar to the following (please refer to [NVIDIA Triton's Statistics Extension documentation](https://github.com/triton-inference-server/server/blob/main/docs/protocol/extension_statistics.md#statistics-response-json-object) for detailed description):
 
+<details>
+<summary>Click to expand the statistics</summary>
 ```shell
 inference time: 2745.272 ms
 {
@@ -192,6 +194,7 @@ inference time: 2745.272 ms
    ]
 }
 ```
+</details>
 
 Images with inferred detections are saved into the same folder, under the newly created subfolder named `results`.
 
@@ -204,6 +207,8 @@ python3 gradio_ui.py
 You can navigate to `http://127.0.0.1:7860`, submit an image via the UI, and inspect the result:
 
 ![Gradio UI](../img/yolo-gratio-ui.png)
+
+Run `deactivate` to exit your Python virtual environment.
 
 ## Observability
 
@@ -234,7 +239,7 @@ To expose Grafana locally, we need to run:
 kubectl port-forward svc/kube-prometheus-stack-grafana 8080:80 -n monitoring 
 ```
 
-To access it, use the `admin` user name, and the output of the following command, as password:
+To access it, open `http://localhost:8080` with your browser, use the `admin` user name, and the output of the following command, as password:
 
 ```bash
 aws secretsmanager get-secret-value --secret-id $(terraform output grafana_secret_name | tr -d \") --region $AWS_REGION --query "SecretString" --output text
@@ -245,6 +250,83 @@ You can learn about the metrics exposed by the NVIDIA Triton Inference Server on
 Particularly interesting for model performance evaluation are the [Latencies](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/metrics.html#latencies) metrics, which you can explore e.g. by importing the `data-on-eks/gen-ai/inference/nvidia-triton-server-gpu/yolo/observability/triton_latency.json` dashboard into your Grafana instance. An example of the output is:
 
 ![YOLO latencies](../img/yolo-latencies.png)
+
+## Performance
+
+The model format used above is [Open Neural Network Exchange](https://onnx.ai/) (ONNX). ONNX is an open format built to represent machine learning models. ONNX defines a common set of operators and a common file format to enable Artificial Inetelligence (AI) developers to use models with various frameworks, tools, runtimes, and compilers.
+
+To improve our model's performance, we can convert it from ONNX format, to [NVIDIA TensorRT](https://docs.nvidia.com/tensorrt/index.html) format.
+
+TensorRT is an SDK for high-performance deep learning inference, that focuses on running an already-trained network quickly and efficiently on NVIDIA hardware. It includes a deep learning inference optimizer and runtime that delivers low latency and high throughput for deep learning inference applications. TensorRT takes a trained network, which consists of a network definition and a set of trained parameters, and produces a highly optimized runtime engine that performs inference for that network. 
+
+To produce the TensorRT formatted model, we need a GPU instance of the same family as the one the model will run on, which is `g5`. You can check that in Karpenter's configuration (see `requirements` in `nodePool` configuration, in the `addons.tf` file, `eks_data_addons` module, `karpenter_resources_helm_config`)
+
+```yaml
+        requirements:
+          - key: "karpenter.k8s.aws/instance-family"
+            operator: In
+            values: ["g5"]
+          - key: "karpenter.k8s.aws/instance-size"
+            operator: In
+            values: [ "2xlarge" ]
+```
+
+We also need to pay attention to the version of TensorRT optimizing the model: it needs to be the same one running it. To achive that, we can to pick the same container image tag we set above for `nvcr.io/nvidia/tritonserver`: `23.09-py3`. Once you have a `g5` instance running, you can run the following commands:
+
+```bash
+pip install ultralytics
+yolo export model=yolov8n.pt format=onnx
+docker run -it --gpus all -v ${PWD}:/trt_optimize nvcr.io/nvidia/tensorrt:23.09-py3
+```
+
+And within the newly created container:
+
+```bash
+trtexec --onnx=/trt_optimize/yolov8n.onnx \
+    --fp16 \
+    --inputIOFormats=fp16:chw \
+    --outputIOFormats=fp16:chw \
+    --saveEngine=/trt_optimize/model.plan
+exit
+```
+
+You can find the TensorRT model, named `model.plan`, in your current directory. **Note**: with the above command, we also quantized the model’s weights from `FP32` to `FP16`, to improve its performance.
+
+To compare the behavior of the two models, ONNX and TensorRT, you need to do the following preparation steps:
+
+1. replace `model.onnx` with `model.plan` in the Amazon S3 bucket, under path `/model_repository/yolo/1/
+
+2. replace the existing Triton container to trigger the model update (edit `<<YOUR TRITON POD>>` below):
+
+```bash
+kubectl delete pod <<YOUR TRITON POD>> -n triton-yolo 
+```
+
+3. edit the client script used in the **Test** section, `triton_client.py`, replacing the FP32 instances with FP16:
+
+From:
+```python
+    img = img.transpose((0, 3, 1, 2)).astype(np.float32)
+
+    inputs = httpclient.InferInput(model_input_name, img.shape, datatype="FP32")
+```
+
+To:
+
+```python
+    img = img.transpose((0, 3, 1, 2)).astype(np.float16)
+
+    inputs = httpclient.InferInput(model_input_name, img.shape, datatype="FP16")
+```
+
+The ONNX output with a folder including ~300 images looks like:
+
+
+![YOLO latencies ONNX](../img/yolo-onnx.png)
+
+While the TensorRT's, with the same image set:
+
+![YOLO latencies TensorRT](../img/yolo-tensorrt.png)
 
 ## Scaling
 
@@ -305,7 +387,11 @@ Events:
 
 From a compute perspective, Karpeneter reacts when the current capacity cannot accommodate further Pods, causing some of them to stay in _Pending_ state. Karpenter at that point requests further Amazon EC2 instances
 
+:::warning
 Please be conscious of the vCPU limits that you might incur on your account, which might prevent Amazon EC2 instances to be created. If that happens, you can trail Karpenter logs with e.g. [Stern](https://pkg.go.dev/github.com/planetscale/stern#section-readme), to confirm:
+
+<details>
+<summary>Click to expand the example log</summary>
 
 ```bash
 {
@@ -326,6 +412,8 @@ Please be conscious of the vCPU limits that you might incur on your account, whi
    "error":"creating instance, insufficient capacity, with fleet error(s), VcpuLimitExceeded: You have requested more vCPU capacity than your current vCPU limit of 64 allows for the instance bucket that the specified instance type belongs to. Please visit http://aws.amazon.com/contact-us/ec2-request to request an adjustment to this limit."
 }
 ```
+</details>
+:::
 
 On the AWS Management Console, you can see the Amazon EC2 instances Karpenter launched, such as:
 
